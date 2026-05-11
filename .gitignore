@@ -4,3 +4,4 @@ perf.data
 *.pyc
 *.DS_Store
 kfxinput/
+/.claude/
