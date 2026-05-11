@@ -301,31 +301,22 @@ impl ExthHeader {
                 109 => exth.rights = Some(decode(content).trim().to_string()),
                 112 => exth.source = Some(decode(content).trim().to_string()),
                 113 => exth.asin = Some(decode(content).trim().to_string()),
-                121 => {
-                    if content.len() >= 4 {
-                        let val =
-                            u32::from_be_bytes([content[0], content[1], content[2], content[3]]);
-                        if val != NULL_INDEX {
-                            exth.kf8_boundary = Some(val);
-                        }
+                121 if content.len() >= 4 => {
+                    let val = u32::from_be_bytes([content[0], content[1], content[2], content[3]]);
+                    if val != NULL_INDEX {
+                        exth.kf8_boundary = Some(val);
                     }
                 }
-                201 => {
-                    if content.len() >= 4 {
-                        let val =
-                            u32::from_be_bytes([content[0], content[1], content[2], content[3]]);
-                        if val != NULL_INDEX {
-                            exth.cover_offset = Some(val);
-                        }
+                201 if content.len() >= 4 => {
+                    let val = u32::from_be_bytes([content[0], content[1], content[2], content[3]]);
+                    if val != NULL_INDEX {
+                        exth.cover_offset = Some(val);
                     }
                 }
-                202 => {
-                    if content.len() >= 4 {
-                        let val =
-                            u32::from_be_bytes([content[0], content[1], content[2], content[3]]);
-                        if val != NULL_INDEX {
-                            exth.thumbnail_offset = Some(val);
-                        }
+                202 if content.len() >= 4 => {
+                    let val = u32::from_be_bytes([content[0], content[1], content[2], content[3]]);
+                    if val != NULL_INDEX {
+                        exth.thumbnail_offset = Some(val);
                     }
                 }
                 503 => exth.title = Some(decode(content).trim().to_string()),

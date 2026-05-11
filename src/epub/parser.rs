@@ -105,19 +105,19 @@ pub fn parse_opf(content: &str) -> io::Result<OpfData> {
                 match local {
                     b"metadata" => in_metadata = true,
                     b"title" | b"creator" | b"language" | b"identifier" | b"publisher"
-                    | b"description" | b"subject" | b"date" | b"rights" | b"contributor" => {
-                        if in_metadata {
-                            current_element = Some(String::from_utf8_lossy(local).to_string());
-                            buf_text.clear();
-                            // Check for id attribute
-                            current_element_id = None;
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"id" {
-                                    current_element_id = Some(
-                                        String::from_utf8(attr.value.to_vec())
-                                            .map_err(io::Error::other)?,
-                                    );
-                                }
+                    | b"description" | b"subject" | b"date" | b"rights" | b"contributor"
+                        if in_metadata =>
+                    {
+                        current_element = Some(String::from_utf8_lossy(local).to_string());
+                        buf_text.clear();
+                        // Check for id attribute
+                        current_element_id = None;
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"id" {
+                                current_element_id = Some(
+                                    String::from_utf8(attr.value.to_vec())
+                                        .map_err(io::Error::other)?,
+                                );
                             }
                         }
                     }
@@ -294,17 +294,13 @@ pub fn parse_opf(content: &str) -> io::Result<OpfData> {
                     _ => {}
                 }
             }
-            Ok(Event::Text(e)) => {
-                if current_element.is_some() || in_meta {
-                    buf_text.push_str(&String::from_utf8_lossy(e.as_ref()));
-                }
+            Ok(Event::Text(e)) if current_element.is_some() || in_meta => {
+                buf_text.push_str(&String::from_utf8_lossy(e.as_ref()));
             }
-            Ok(Event::GeneralRef(e)) => {
-                if current_element.is_some() || in_meta {
-                    let entity = String::from_utf8_lossy(e.as_ref());
-                    if let Some(resolved) = resolve_entity(&entity) {
-                        buf_text.push_str(&resolved);
-                    }
+            Ok(Event::GeneralRef(e)) if current_element.is_some() || in_meta => {
+                let entity = String::from_utf8_lossy(e.as_ref());
+                if let Some(resolved) = resolve_entity(&entity) {
+                    buf_text.push_str(&resolved);
                 }
             }
             Ok(Event::End(e)) => {
@@ -739,17 +735,13 @@ pub fn parse_nav_landmarks(content: &str) -> io::Result<Vec<Landmark>> {
                     _ => {}
                 }
             }
-            Ok(Event::Text(e)) => {
-                if in_anchor {
-                    current_label.push_str(&String::from_utf8_lossy(e.as_ref()));
-                }
+            Ok(Event::Text(e)) if in_anchor => {
+                current_label.push_str(&String::from_utf8_lossy(e.as_ref()));
             }
-            Ok(Event::GeneralRef(e)) => {
-                if in_anchor {
-                    let entity = String::from_utf8_lossy(e.as_ref());
-                    if let Some(resolved) = resolve_entity(&entity) {
-                        current_label.push_str(&resolved);
-                    }
+            Ok(Event::GeneralRef(e)) if in_anchor => {
+                let entity = String::from_utf8_lossy(e.as_ref());
+                if let Some(resolved) = resolve_entity(&entity) {
+                    current_label.push_str(&resolved);
                 }
             }
             Ok(Event::End(e)) => {

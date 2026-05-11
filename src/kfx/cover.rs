@@ -36,13 +36,11 @@ pub fn is_image_only_chapter(chapter: &Chapter) -> bool {
             Role::Image => {
                 image_count += 1;
             }
-            Role::Text => {
+            Role::Text if !node.text.is_empty() => {
                 // Check if there's actual text content (not just whitespace)
-                if !node.text.is_empty() {
-                    let text = chapter.text(node.text);
-                    if !text.trim().is_empty() {
-                        has_text = true;
-                    }
+                let text = chapter.text(node.text);
+                if !text.trim().is_empty() {
+                    has_text = true;
                 }
             }
             _ => {}
