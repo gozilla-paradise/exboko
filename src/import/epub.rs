@@ -264,10 +264,21 @@ impl EpubImporter {
             path_to_chapter.insert(base_path.to_string(), ChapterId(i as u32));
         }
 
+        // Resolve cover_image to an absolute (zip-relative) path so it matches
+        // asset keys downstream. The OPF parser leaves it as a manifest href
+        // relative to opf_base.
+        let mut metadata = opf.metadata;
+        if let Some(ref href) = metadata.cover_image
+            && !href.is_empty()
+            && !opf_base.is_empty()
+        {
+            metadata.cover_image = Some(format!("{}{}", opf_base, href));
+        }
+
         Ok(Self {
             source,
             zip_index,
-            metadata: opf.metadata,
+            metadata,
             toc,
             landmarks,
             spine,
