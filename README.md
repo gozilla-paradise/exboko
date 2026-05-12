@@ -7,9 +7,9 @@
 
 Boko is a fast ebook converter for EPUB, KFX, AZW3, and MOBI, written in Rust.
 
-KFX renders with hyphenation, kerning, and ligatures. AZW3 doesn't. MOBI (Calibre's default Kindle format) is 25 years old at this point. It's 2026, use boko to send .kfx files to your Kindle!
+KFX renders with hyphenation, kerning, and ligatures. AZW3 doesn't. MOBI (Calibre's default Kindle format) is 25 years old at this point. boko is the only KFX writer that doesn't run Amazon's proprietary Kindle Previewer software. It's 2026, use boko to send .kfx files to your Kindle!
 
-Browser app: https://zacharydenton.github.io/boko Converts ebooks in your browser, fully client-side (even on your phone).
+Browser app: https://zacharydenton.github.io/boko. Converts ebooks in your browser, fully client-side.
 
 ## Formats
 
