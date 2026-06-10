@@ -206,6 +206,13 @@ pub(crate) fn parse_length(input: &mut Parser<'_, '_>) -> Option<Length> {
                 "ex" => Length::Em(*value * 0.5),
                 // pt = points, 1pt = 96/72 px
                 "pt" => Length::Px(*value * 96.0 / 72.0),
+                // pc = picas, 1pc = 12pt = 16px
+                "pc" => Length::Px(*value * 16.0),
+                // physical units at the CSS reference 96dpi
+                "in" => Length::Px(*value * 96.0),
+                "cm" => Length::Px(*value * 96.0 / 2.54),
+                "mm" => Length::Px(*value * 96.0 / 25.4),
+                "q" => Length::Px(*value * 96.0 / 101.6),
                 _ => return None,
             };
             Some(length)

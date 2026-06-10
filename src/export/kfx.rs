@@ -28,6 +28,7 @@ use crate::kfx::transforms::format_to_kfx_symbol;
 use crate::model::{
     AnchorTarget, Book, Chapter, GlobalNodeId, LandmarkType, NodeId, ResolvedLinks, Role,
 };
+use crate::style::{ComputedStyle as IrComputedStyle, Length as IrLength};
 use crate::util::detect_media_format;
 
 /// KFX export configuration.
@@ -332,10 +333,11 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
     }
 
     for (chapter_id, section_name) in &spine_info {
-        if let Ok(chapter) = book.load_chapter(*chapter_id) {
+        if let Ok(mut chapter) = book.load_chapter(*chapter_id) {
             // Set up chapter-start anchor before generating content
             ctx.begin_chapter_export(*chapter_id);
 
+            collapse_block_margins(&mut chapter);
             let (section, storyline, content) =
                 build_chapter_entities_grouped(&chapter, *chapter_id, section_name, &mut ctx);
             section_fragments.push(section);
@@ -595,14 +597,316 @@ fn build_style_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment> {
     // making the device font-size setting behave consistently across books.
     let dominant = dominant_font_size(&style_entries);
 
-    style_entries
+    let mut entries: Vec<(String, IonValue, u64)> = style_entries
         .into_iter()
-        .map(|(name, mut ion, _usage)| {
+        .map(|(name, mut ion, usage)| {
             rewrite_embedded_font_families(&mut ion, &ctx.embedded_font_families);
             normalize_font_size(&mut ion, dominant);
-            KfxFragment::new(KfxSymbol::Style, &name, ion)
+            (name, ion, usage)
         })
+        .collect();
+
+    // Line-height normalization needs the dominant value across all styles
+    // (computed after font normalization so px line heights resolve correctly)
+    let dominant_lh = dominant_line_height(&entries);
+
+    for (_, ion, _) in &mut entries {
+        convert_style_units(ion, dominant_lh);
+    }
+
+    entries
+        .into_iter()
+        .map(|(name, ion, _)| KfxFragment::new(KfxSymbol::Style, &name, ion))
         .collect()
+}
+
+/// Roles whose vertical margins collapse with adjacent siblings (CSS-style).
+fn is_collapsible_block(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Paragraph | Role::Heading(_) | Role::Figure | Role::OrderedList | Role::UnorderedList
+    )
+}
+
+/// Resolve a node's font size to rem (best effort; em approximated as rem).
+fn ir_font_rem(style: &IrComputedStyle) -> f64 {
+    match style.font_size {
+        IrLength::Px(v) => (v / 16.0) as f64,
+        IrLength::Rem(v) => v as f64,
+        IrLength::Em(v) => v as f64,
+        _ => 1.0,
+    }
+}
+
+/// Resolve a margin length to rem; None for percent (not collapsible here).
+fn ir_margin_rem(len: IrLength, font_rem: f64) -> Option<f64> {
+    match len {
+        IrLength::Px(v) => Some((v / 16.0) as f64),
+        IrLength::Rem(v) => Some(v as f64),
+        IrLength::Em(v) => Some(v as f64 * font_rem),
+        // Unset margins are 0 (Length defaults to Auto)
+        IrLength::Auto => Some(0.0),
+        IrLength::Percent(_) => None,
+    }
+}
+
+/// Simulate CSS adjacent-sibling margin collapsing for KFX export.
+///
+/// The Kindle renderer stacks vertical margins instead of collapsing them, so
+/// `p { margin-top: 15pt; margin-bottom: 10pt }` renders 25pt gaps where a
+/// browser shows 15pt. Like Kindle Previewer, fold each adjacent block pair:
+/// the following block's margin-top becomes max(prev bottom, own top) and the
+/// preceding block's margin-bottom is cleared.
+fn collapse_block_margins(chapter: &mut Chapter) {
+    for parent_idx in 0..chapter.node_count() {
+        let parent_id = NodeId(parent_idx as u32);
+
+        // Block children in order, skipping whitespace-only text nodes
+        let blocks: Vec<NodeId> = chapter
+            .children(parent_id)
+            .filter(|id| {
+                let Some(node) = chapter.node(*id) else {
+                    return false;
+                };
+                if node.role == Role::Text {
+                    return !chapter.text(node.text).trim().is_empty();
+                }
+                true
+            })
+            .collect();
+
+        for pair in blocks.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let (Some(node_a), Some(node_b)) = (chapter.node(a), chapter.node(b)) else {
+                continue;
+            };
+            if !is_collapsible_block(node_a.role) || !is_collapsible_block(node_b.role) {
+                continue;
+            }
+            let (Some(style_a), Some(style_b)) = (
+                chapter.styles.get(node_a.style).cloned(),
+                chapter.styles.get(node_b.style).cloned(),
+            ) else {
+                continue;
+            };
+
+            // Adjacent sibling margins always collapse in CSS (borders and
+            // padding only prevent parent-child collapsing)
+            let (Some(bottom), Some(top)) = (
+                ir_margin_rem(style_a.margin_bottom, ir_font_rem(&style_a)),
+                ir_margin_rem(style_b.margin_top, ir_font_rem(&style_b)),
+            ) else {
+                continue;
+            };
+            if bottom <= 0.0 {
+                continue;
+            }
+
+            let gap = bottom.max(top);
+            let mut new_a = style_a;
+            new_a.margin_bottom = IrLength::Px(0.0);
+            let mut new_b = style_b;
+            new_b.margin_top = IrLength::Rem(gap as f32);
+
+            let style_a_id = chapter.styles.intern(new_a);
+            let style_b_id = chapter.styles.intern(new_b);
+            if let Some(n) = chapter.node_mut(a) {
+                n.style = style_a_id;
+            }
+            if let Some(n) = chapter.node_mut(b) {
+                n.style = style_b_id;
+            }
+        }
+    }
+}
+
+/// KFX document default line height (matches document_data); 1lh = 1.2rem.
+const DOC_LINE_HEIGHT_REM: f64 = 1.2;
+/// Kindle Previewer's percent base: the page is modeled as 32rem wide,
+/// so 1rem = 3.125 percent.
+const PERCENT_PER_REM: f64 = 100.0 / 32.0;
+
+/// Format a numeric value as an Ion decimal string.
+fn format_decimal(v: f64) -> String {
+    let s = format!("{:.5}", v);
+    let t = s.trim_end_matches('0').trim_end_matches('.');
+    if t.is_empty() || t == "-" {
+        "0".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Read a `{value, unit}` dimension struct, returning (value, unit symbol id).
+fn read_dimension(value: &IonValue) -> Option<(f64, u32)> {
+    let IonValue::Struct(dim) = value else {
+        return None;
+    };
+    let mut num = None;
+    let mut unit = None;
+    for (id, v) in dim {
+        if *id == KfxSymbol::Value as u64 {
+            num = match v {
+                IonValue::Decimal(s) => s.parse::<f64>().ok(),
+                IonValue::Int(i) => Some(*i as f64),
+                IonValue::Float(f) => Some(*f),
+                _ => None,
+            };
+        } else if *id == KfxSymbol::Unit as u64
+            && let IonValue::Symbol(s) = v
+        {
+            unit = Some(*s as u32);
+        }
+    }
+    Some((num?, unit?))
+}
+
+/// Build a `{value, unit}` dimension struct.
+fn make_dimension(value: f64, unit: KfxSymbol) -> IonValue {
+    IonValue::Struct(vec![
+        (
+            KfxSymbol::Value as u64,
+            IonValue::Decimal(format_decimal(value)),
+        ),
+        (KfxSymbol::Unit as u64, IonValue::Symbol(unit as u64)),
+    ])
+}
+
+/// Convert an absolute dimension to rem. `font_rem` resolves em values
+/// (em is relative to the element's normalized font size).
+fn to_rem(value: f64, unit: u32, font_rem: f64) -> Option<f64> {
+    if unit == KfxSymbol::Px as u32 {
+        Some(value / 16.0)
+    } else if unit == KfxSymbol::Em as u32 {
+        Some(value * font_rem)
+    } else if unit == KfxSymbol::Rem as u32 {
+        Some(value)
+    } else if unit == KfxSymbol::Pt as u32 {
+        Some(value / 12.0)
+    } else {
+        None
+    }
+}
+
+/// Resolve a line-height dimension to a font-relative (unitless) factor.
+fn line_height_factor(value: f64, unit: u32, font_rem: f64) -> Option<f64> {
+    if unit == KfxSymbol::Em as u32 {
+        Some(value)
+    } else if unit == KfxSymbol::Px as u32 {
+        Some(value / 16.0 / font_rem)
+    } else if unit == KfxSymbol::Rem as u32 {
+        Some(value / font_rem)
+    } else if unit == KfxSymbol::Pt as u32 {
+        Some(value / 12.0 / font_rem)
+    } else {
+        None
+    }
+}
+
+/// Find the usage-weighted dominant line-height factor across all styles.
+fn dominant_line_height(entries: &[(String, IonValue, u64)]) -> Option<f64> {
+    use std::collections::HashMap;
+
+    let mut usage_by_lh: HashMap<u64, u64> = HashMap::new();
+    for (_, ion, usage) in entries {
+        let IonValue::Struct(fields) = ion else {
+            continue;
+        };
+        let font_rem = style_font_size_rem(fields).unwrap_or(1.0);
+        let Some((v, unit)) = fields
+            .iter()
+            .find(|(id, _)| *id == KfxSymbol::LineHeight as u64)
+            .and_then(|(_, v)| read_dimension(v))
+        else {
+            continue;
+        };
+        if let Some(factor) = line_height_factor(v, unit, font_rem) {
+            *usage_by_lh.entry(factor.to_bits()).or_default() += usage;
+        }
+    }
+
+    usage_by_lh
+        .into_iter()
+        .max_by_key(|(_, usage)| *usage)
+        .map(|(bits, _)| f64::from_bits(bits))
+        .filter(|v| *v > 0.0)
+}
+
+/// Convert style dimension units to Kindle Previewer's conventions:
+/// - vertical margins/padding in `lh` (1lh = the 1.2rem document line height),
+///   dropping zero values
+/// - horizontal margins/padding and text_indent in percent of the 32rem page
+///   model, dropping zero margins/padding (zero indents are kept: they cancel
+///   an inherited indent)
+/// - line_height normalized so the dominant value is 1lh
+/// - absolute widths as capped percent; absolute heights dropped
+fn convert_style_units(ion: &mut IonValue, dominant_lh: Option<f64>) {
+    let IonValue::Struct(fields) = ion else {
+        return;
+    };
+    let font_rem = style_font_size_rem(fields).unwrap_or(1.0);
+
+    const VERTICAL: [KfxSymbol; 4] = [
+        KfxSymbol::MarginTop,
+        KfxSymbol::MarginBottom,
+        KfxSymbol::PaddingTop,
+        KfxSymbol::PaddingBottom,
+    ];
+    const HORIZONTAL: [KfxSymbol; 4] = [
+        KfxSymbol::MarginLeft,
+        KfxSymbol::MarginRight,
+        KfxSymbol::PaddingLeft,
+        KfxSymbol::PaddingRight,
+    ];
+
+    let mut remove: Vec<u64> = Vec::new();
+    for (id, value) in fields.iter_mut() {
+        let sym = *id;
+        let Some((v, unit)) = read_dimension(value) else {
+            continue;
+        };
+
+        if VERTICAL.iter().any(|s| *s as u64 == sym) {
+            if v.abs() < 1e-9 {
+                remove.push(sym);
+            } else if let Some(rem) = to_rem(v, unit, font_rem) {
+                *value = make_dimension(rem / DOC_LINE_HEIGHT_REM, KfxSymbol::Lh);
+            }
+        } else if HORIZONTAL.iter().any(|s| *s as u64 == sym) {
+            if v.abs() < 1e-9 {
+                remove.push(sym);
+            } else if let Some(rem) = to_rem(v, unit, font_rem) {
+                *value = make_dimension(rem * PERCENT_PER_REM, KfxSymbol::Percent);
+            }
+        } else if sym == KfxSymbol::TextIndent as u64 {
+            if unit == KfxSymbol::Percent as u32 {
+                continue;
+            }
+            if let Some(rem) = to_rem(v, unit, font_rem) {
+                *value = make_dimension(rem * PERCENT_PER_REM, KfxSymbol::Percent);
+            }
+        } else if sym == KfxSymbol::LineHeight as u64 {
+            if unit == KfxSymbol::Lh as u32 {
+                continue;
+            }
+            if let (Some(factor), Some(dom)) = (line_height_factor(v, unit, font_rem), dominant_lh)
+            {
+                *value = make_dimension(factor / dom, KfxSymbol::Lh);
+            }
+        } else if sym == KfxSymbol::Width as u64 {
+            if unit == KfxSymbol::Percent as u32 {
+                continue;
+            }
+            if let Some(rem) = to_rem(v, unit, font_rem) {
+                let percent = (rem * PERCENT_PER_REM).min(100.0);
+                *value = make_dimension(percent, KfxSymbol::Percent);
+            }
+        } else if sym == KfxSymbol::Height as u64 && to_rem(v, unit, font_rem).is_some() {
+            // Absolute heights don't reflow; Kindle Previewer drops them
+            remove.push(sym);
+        }
+    }
+    fields.retain(|(id, _)| !remove.contains(id));
 }
 
 /// Read a style's font_size in rem from its Ion struct fields, if present.
@@ -661,7 +965,9 @@ fn dominant_font_size(style_entries: &[(String, IonValue, u64)]) -> f64 {
 /// behavior: dominant text becomes 1rem; em-based spacing follows the font
 /// size automatically, so proportions are preserved).
 fn normalize_font_size(ion: &mut IonValue, dominant: f64) {
-    if dominant <= 0.0 || (dominant - 1.0).abs() < 1e-6 {
+    // Run even when dominant == 1.0 so explicit 1rem font sizes get dropped
+    // (Kindle Previewer omits them; they equal the document default)
+    if dominant <= 0.0 {
         return;
     }
     let IonValue::Struct(fields) = ion else {

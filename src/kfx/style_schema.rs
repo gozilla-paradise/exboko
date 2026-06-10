@@ -2206,6 +2206,11 @@ impl ValueTransform {
                     })?;
                 let unit_sym = get_field_by_symbol(fields, KfxSymbol::Unit)?.as_symbol()? as u32;
 
+                // KFX lh units are relative to the 1.2rem document line height
+                if unit_sym == KfxSymbol::Lh as u32 {
+                    return Some(format!("{}em", num * 1.2));
+                }
+
                 // Convert unit symbol back to CSS unit string
                 let unit_str = match unit_sym {
                     id if id == KfxSymbol::Em as u32 => "em",

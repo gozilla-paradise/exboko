@@ -1515,7 +1515,9 @@ pub fn tokens_to_ion(tokens: &TokenStream, ctx: &mut ExportContext) -> IonValue 
                 if let Some(completed) = stack.pop() {
                     let is_inner = completed.is_inner_wrapper_text;
                     if let Some(parent) = stack.last_mut() {
-                        parent.add_child(completed.build(ctx));
+                        for built in completed.build_hoisted(ctx) {
+                            parent.add_child(built);
+                        }
                     }
 
                     // If this was an inner wrapper text element, we need to also
@@ -1695,6 +1697,29 @@ impl IonBuilder {
         }
 
         self.style_events.push(IonValue::Struct(event_fields));
+    }
+
+    /// Build, hoisting child elements out of `type: text` elements.
+    ///
+    /// Kindle renders only the content reference of a text element; nested
+    /// content_list children (e.g. an image inside a `<p>`) are not displayed.
+    /// Kindle Previewer emits such children as siblings instead, so split the
+    /// element: the text part first, then its children.
+    fn build_hoisted(mut self, ctx: &mut ExportContext) -> Vec<IonValue> {
+        let is_text = self.fields.iter().any(|(id, v)| {
+            *id == sym!(Type) && matches!(v, IonValue::Symbol(s) if *s == KfxSymbol::Text as u64)
+        });
+        if !is_text || self.children.is_empty() {
+            return match self.build(ctx) {
+                IonValue::Null => vec![],
+                other => vec![other],
+            };
+        }
+
+        let children = std::mem::take(&mut self.children);
+        let mut out = vec![self.build(ctx)];
+        out.extend(children);
+        out
     }
 
     /// Finalize and build the Ion struct, creating content reference if text was accumulated.
