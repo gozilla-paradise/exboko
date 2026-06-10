@@ -181,8 +181,8 @@ fn hash_kfx_value<H: Hasher>(value: &KfxValue, hasher: &mut H) {
 
 /// Registry for collecting and deduplicating styles during export.
 pub struct StyleRegistry {
-    /// Hash -> (style_id, style_name_symbol, computed_style)
-    styles: HashMap<u64, (u64, u64, ComputedStyle)>,
+    /// Hash -> (style_id, style_name_symbol, computed_style, usage_count)
+    styles: HashMap<u64, (u64, u64, ComputedStyle, u64)>,
 
     /// Next style ID to assign
     next_style_id: u64,
@@ -192,6 +192,9 @@ pub struct StyleRegistry {
 
     /// Default style name symbol
     default_style_symbol: u64,
+
+    /// How many elements reference the default (empty) style.
+    default_usage: u64,
 }
 
 impl StyleRegistry {
@@ -205,6 +208,7 @@ impl StyleRegistry {
             next_style_id: 1, // Start at 1, 0 is default
             default_style_id: 0,
             default_style_symbol,
+            default_usage: 0,
         }
     }
 
@@ -228,12 +232,14 @@ impl StyleRegistry {
         symbols: &mut crate::kfx::context::SymbolTable,
     ) -> u64 {
         if style.is_empty() {
+            self.default_usage += 1;
             return self.default_style_symbol;
         }
 
         let hash = style.compute_hash();
 
-        if let Some((_, name_symbol, _)) = self.styles.get(&hash) {
+        if let Some((_, name_symbol, _, usage)) = self.styles.get_mut(&hash) {
+            *usage += 1;
             return *name_symbol;
         }
 
@@ -244,7 +250,7 @@ impl StyleRegistry {
         let style_name = format!("s{:X}", style_id);
         let name_symbol = symbols.get_or_intern(&style_name);
 
-        self.styles.insert(hash, (style_id, name_symbol, style));
+        self.styles.insert(hash, (style_id, name_symbol, style, 1));
 
         name_symbol
     }
@@ -261,8 +267,10 @@ impl StyleRegistry {
 
     /// Drain all styles into KFX fragments.
     ///
-    /// Returns a list of (style_name, IonValue) pairs for building style entities.
-    pub fn drain_to_ion(&mut self) -> Vec<(String, IonValue)> {
+    /// Returns a list of (style_name, IonValue, usage_count) tuples for
+    /// building style entities. Usage counts how many storyline elements
+    /// reference each style (used for font-size normalization).
+    pub fn drain_to_ion(&mut self) -> Vec<(String, IonValue, u64)> {
         let mut result = Vec::new();
 
         // First, add the default style
@@ -270,15 +278,15 @@ impl StyleRegistry {
             KfxSymbol::StyleName as u64,
             IonValue::Symbol(self.default_style_symbol),
         )]);
-        result.push(("s0".to_string(), default_ion));
+        result.push(("s0".to_string(), default_ion, self.default_usage));
 
         // Then all registered styles
-        // Tuple is (style_id, name_symbol, computed_style)
-        for (_, (style_id, name_symbol, style)) in self.styles.drain() {
+        // Tuple is (style_id, name_symbol, computed_style, usage)
+        for (_, (style_id, name_symbol, style, usage)) in self.styles.drain() {
             let ion = style.to_ion(name_symbol);
             // Use style_id for the fragment name (e.g., "s1", "s2", "sA")
             let name = format!("s{:X}", style_id);
-            result.push((name, ion));
+            result.push((name, ion, usage));
         }
 
         result
@@ -286,7 +294,7 @@ impl StyleRegistry {
 
     /// Get all styles without draining.
     pub fn styles(&self) -> impl Iterator<Item = (&u64, &ComputedStyle)> {
-        self.styles.values().map(|(id, _, style)| (id, style))
+        self.styles.values().map(|(id, _, style, _)| (id, style))
     }
 }
 

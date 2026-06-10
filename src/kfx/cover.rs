@@ -112,6 +112,7 @@ pub fn needs_standalone_cover(cover_image_path: &str, first_chapter: &Chapter) -
 /// # Arguments
 /// * `cover_path` - Path to the cover image resource
 /// * `section_id` - Fragment ID for the section
+/// * `dimensions` - Cover image (width, height) in pixels, if known
 /// * `ctx` - Export context for symbol interning and resource lookup
 ///
 /// # Returns
@@ -119,6 +120,7 @@ pub fn needs_standalone_cover(cover_image_path: &str, first_chapter: &Chapter) -
 pub fn build_cover_section(
     cover_path: &str,
     section_id: u64,
+    dimensions: Option<(u32, u32)>,
     ctx: &mut ExportContext,
 ) -> (KfxFragment, KfxFragment) {
     let section_name = COVER_SECTION_NAME;
@@ -169,6 +171,8 @@ pub fn build_cover_section(
     let storyline_fragment = KfxFragment::new(KfxSymbol::Storyline, &story_name, storyline_ion);
 
     // Build section (page_template): container type with fixed dimensions
+    // matching the cover image (fall back to a standard portrait size)
+    let (width, height) = dimensions.unwrap_or((1400, 2100));
     let page_template = IonValue::Struct(vec![
         (KfxSymbol::Id as u64, IonValue::Int(section_id as i64)),
         (
@@ -179,8 +183,8 @@ pub fn build_cover_section(
             KfxSymbol::Type as u64,
             IonValue::Symbol(KfxSymbol::Container as u64),
         ),
-        (KfxSymbol::FixedWidth as u64, IonValue::Int(1400)),
-        (KfxSymbol::FixedHeight as u64, IonValue::Int(2100)),
+        (KfxSymbol::FixedWidth as u64, IonValue::Int(width as i64)),
+        (KfxSymbol::FixedHeight as u64, IonValue::Int(height as i64)),
         (
             KfxSymbol::Layout as u64,
             IonValue::Symbol(KfxSymbol::ScaleFit as u64),
@@ -269,6 +273,42 @@ mod tests {
             needs_standalone_cover(&cover_path, &chapter),
             "should need standalone cover when images differ"
         );
+    }
+
+    #[test]
+    fn test_build_cover_section_uses_image_dimensions() {
+        use crate::kfx::context::ExportContext;
+        use crate::kfx::ion::IonValue;
+        use crate::kfx::symbols::KfxSymbol;
+
+        let mut ctx = ExportContext::new();
+        let (section, _storyline) =
+            build_cover_section("images/cover.jpg", 100, Some((1024, 572)), &mut ctx);
+
+        let crate::kfx::fragment::FragmentData::Ion(IonValue::Struct(fields)) = &section.data
+        else {
+            panic!("expected Ion struct");
+        };
+        let Some((_, IonValue::List(templates))) = fields
+            .iter()
+            .find(|(id, _)| *id == KfxSymbol::PageTemplates as u64)
+        else {
+            panic!("expected page_templates list");
+        };
+        let IonValue::Struct(template) = &templates[0] else {
+            panic!("expected template struct");
+        };
+
+        let width = template
+            .iter()
+            .find(|(id, _)| *id == KfxSymbol::FixedWidth as u64)
+            .map(|(_, v)| v);
+        let height = template
+            .iter()
+            .find(|(id, _)| *id == KfxSymbol::FixedHeight as u64)
+            .map(|(_, v)| v);
+        assert!(matches!(width, Some(IonValue::Int(1024))));
+        assert!(matches!(height, Some(IonValue::Int(572))));
     }
 
     #[test]

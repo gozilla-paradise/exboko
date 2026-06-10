@@ -17,7 +17,7 @@ use crate::kfx::cover::{
 use crate::kfx::fragment::KfxFragment;
 use crate::kfx::ion::IonValue;
 use crate::kfx::metadata::{
-    MetadataCategory, MetadataContext, build_category_entries, generate_book_id,
+    MetadataCategory, MetadataContext, build_category_entries, generate_asin, generate_book_id,
 };
 use crate::kfx::serialization::{
     SerializedEntity, create_entity_data, generate_container_id, serialize_annotated_ion,
@@ -276,7 +276,20 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
     fragments.push(build_content_features_fragment());
 
     // 2b. Book metadata fragment ($490) - contains categorised_metadata
-    fragments.push(build_book_metadata_fragment(book, &container_id, &ctx));
+    let mut embedded_families: Vec<String> = Vec::new();
+    for face in book.font_faces() {
+        if !embedded_families.contains(&face.font_family) {
+            embedded_families.push(face.font_family.clone());
+        }
+    }
+    let has_embedded_fonts = !embedded_families.is_empty();
+    ctx.embedded_font_families = embedded_families;
+    fragments.push(build_book_metadata_fragment(
+        book,
+        &container_id,
+        has_embedded_fonts,
+        &ctx,
+    ));
 
     // 2c. Metadata fragment ($258) - contains reading_orders
     fragments.push(build_metadata_fragment(&ctx));
@@ -301,7 +314,14 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
         let cover_content_id = ctx.fragment_ids.peek();
         // Store cover content ID for position_map (so c0 contains both section and content IDs)
         ctx.cover_content_id = Some(cover_content_id);
-        let (section, storyline) = build_cover_section(cover_path, section_id, &mut ctx);
+        // Use the cover image's real dimensions for the fixed-layout section,
+        // matching Kindle Previewer output
+        let cover_dims = book
+            .load_asset(std::path::Path::new(cover_path))
+            .ok()
+            .and_then(|data| crate::util::extract_image_dimensions(&data));
+        let (section, storyline) =
+            build_cover_section(cover_path, section_id, cover_dims, &mut ctx);
         section_fragments.push(section);
         storyline_fragments.push(storyline);
 
@@ -370,15 +390,19 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
     }
 
     // 2j. Resource fragments (images, fonts, etc.)
-    // Each resource gets two entities: external_resource (metadata) + bcRawMedia (bytes)
+    // Images get two entities: external_resource (metadata) + bcRawMedia (bytes).
+    // Fonts get a single bcRawFont entity with no external_resource, matching
+    // Kindle Previewer output (fonts are referenced by font entities via location).
     for asset_path in &asset_paths {
         if is_media_asset(asset_path)
             && let Ok(data) = book.load_asset(asset_path)
         {
             let href = asset_path.to_string_lossy().to_string();
-            // external_resource ($164) - metadata about the resource
-            fragments.push(build_external_resource_fragment(&href, &data, &mut ctx));
-            // bcRawMedia ($417) - the actual bytes
+            if !detect_media_format(&href, &data).is_font() {
+                // external_resource ($164) - metadata about the resource
+                fragments.push(build_external_resource_fragment(&href, &data, &mut ctx));
+            }
+            // bcRawMedia ($417) / bcRawFont ($418) - the actual bytes
             fragments.push(build_resource_fragment(&href, &data, &mut ctx));
         }
     }
@@ -565,12 +589,151 @@ fn register_chapter_link_targets(
 /// This generates all collected styles from the registry, including the default.
 fn build_style_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment> {
     // Drain all styles from the registry to generate Ion fragments
-    let style_pairs = ctx.style_registry.drain_to_ion();
+    let style_entries = ctx.style_registry.drain_to_ion();
 
-    style_pairs
+    // Kindle Previewer rescales font sizes so the dominant text size is 1rem,
+    // making the device font-size setting behave consistently across books.
+    let dominant = dominant_font_size(&style_entries);
+
+    style_entries
         .into_iter()
-        .map(|(name, ion)| KfxFragment::new(KfxSymbol::Style, &name, ion))
+        .map(|(name, mut ion, _usage)| {
+            rewrite_embedded_font_families(&mut ion, &ctx.embedded_font_families);
+            normalize_font_size(&mut ion, dominant);
+            KfxFragment::new(KfxSymbol::Style, &name, ion)
+        })
         .collect()
+}
+
+/// Read a style's font_size in rem from its Ion struct fields, if present.
+fn style_font_size_rem(fields: &[(u64, IonValue)]) -> Option<f64> {
+    let (_, font_size) = fields
+        .iter()
+        .find(|(id, _)| *id == KfxSymbol::FontSize as u64)?;
+    let IonValue::Struct(dim) = font_size else {
+        return None;
+    };
+    let is_rem = dim.iter().any(|(id, v)| {
+        *id == KfxSymbol::Unit as u64
+            && matches!(v, IonValue::Symbol(s) if *s == KfxSymbol::Rem as u64)
+    });
+    if !is_rem {
+        return None;
+    }
+    dim.iter().find_map(|(id, v)| {
+        if *id != KfxSymbol::Value as u64 {
+            return None;
+        }
+        match v {
+            IonValue::Decimal(s) => s.parse::<f64>().ok(),
+            IonValue::Int(i) => Some(*i as f64),
+            IonValue::Float(f) => Some(*f),
+            _ => None,
+        }
+    })
+}
+
+/// Find the usage-weighted dominant font size across all styles.
+///
+/// Styles without an explicit rem font_size count as 1.0 (they inherit the
+/// 1em document default).
+fn dominant_font_size(style_entries: &[(String, IonValue, u64)]) -> f64 {
+    use std::collections::HashMap;
+
+    let mut usage_by_size: HashMap<u64, u64> = HashMap::new();
+    for (_, ion, usage) in style_entries {
+        let size = match ion {
+            IonValue::Struct(fields) => style_font_size_rem(fields).unwrap_or(1.0),
+            _ => 1.0,
+        };
+        *usage_by_size.entry(size.to_bits()).or_default() += usage;
+    }
+
+    usage_by_size
+        .into_iter()
+        .max_by_key(|(_, usage)| *usage)
+        .map(|(bits, _)| f64::from_bits(bits))
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0)
+}
+
+/// Rescale a style's rem font_size by the dominant size (Kindle Previewer
+/// behavior: dominant text becomes 1rem; em-based spacing follows the font
+/// size automatically, so proportions are preserved).
+fn normalize_font_size(ion: &mut IonValue, dominant: f64) {
+    if dominant <= 0.0 || (dominant - 1.0).abs() < 1e-6 {
+        return;
+    }
+    let IonValue::Struct(fields) = ion else {
+        return;
+    };
+    let Some(size) = style_font_size_rem(fields) else {
+        return;
+    };
+    let scaled = size / dominant;
+
+    if (scaled - 1.0).abs() < 1e-6 {
+        // Dominant text renders at the document default; drop the property
+        // entirely like Kindle Previewer does
+        fields.retain(|(id, _)| *id != KfxSymbol::FontSize as u64);
+        return;
+    }
+
+    for (id, value) in fields.iter_mut() {
+        if *id != KfxSymbol::FontSize as u64 {
+            continue;
+        }
+        let IonValue::Struct(dim) = value else {
+            continue;
+        };
+        for (dim_id, dim_value) in dim.iter_mut() {
+            if *dim_id == KfxSymbol::Value as u64 {
+                let formatted = format!("{:.5}", scaled);
+                let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+                *dim_value = IonValue::Decimal(trimmed.to_string());
+            }
+        }
+    }
+}
+
+/// Rewrite style font_family values that name an embedded font to "default".
+///
+/// Hardcoding the embedded family in styles locks the Kindle font selector:
+/// the user's font choice never applies. Kindle Previewer instead points
+/// styles at "default" (which follows the user's choice / publisher font)
+/// and makes the embedded font the document default in document_data.
+fn rewrite_embedded_font_families(ion: &mut IonValue, embedded_families: &[String]) {
+    if embedded_families.is_empty() {
+        return;
+    }
+    let IonValue::Struct(fields) = ion else {
+        return;
+    };
+    for (id, value) in fields.iter_mut() {
+        if *id != KfxSymbol::FontFamily as u64 {
+            continue;
+        }
+        let IonValue::String(family_list) = value else {
+            continue;
+        };
+        let mut rewritten: Vec<&str> = Vec::new();
+        for family in family_list.split(',') {
+            let name = family.trim().trim_matches(['"', '\'']);
+            let mapped = if embedded_families
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name))
+            {
+                "default"
+            } else {
+                name
+            };
+            // Drop duplicates introduced by mapping several families to "default"
+            if rewritten.last() != Some(&mapped) {
+                rewritten.push(mapped);
+            }
+        }
+        *family_list = rewritten.join(",");
+    }
 }
 
 /// Build the metadata fragment ($258) - contains reading_orders.
@@ -606,6 +769,7 @@ fn build_metadata_fragment(ctx: &ExportContext) -> KfxFragment {
 fn build_book_metadata_fragment(
     book: &Book,
     container_id: &str,
+    has_embedded_fonts: bool,
     ctx: &ExportContext,
 ) -> KfxFragment {
     let meta = book.metadata();
@@ -636,11 +800,14 @@ fn build_book_metadata_fragment(
         None
     });
 
-    // Generate book_id from identifier (deterministic per publication)
-    let book_id = if !meta.identifier.is_empty() {
-        Some(generate_book_id(&meta.identifier))
+    // Generate book_id and ASIN from identifier (deterministic per publication)
+    let (book_id, asin) = if !meta.identifier.is_empty() {
+        (
+            Some(generate_book_id(&meta.identifier)),
+            Some(generate_asin(&meta.identifier)),
+        )
     } else {
-        None
+        (None, None)
     };
 
     let meta_ctx = MetadataContext {
@@ -648,6 +815,7 @@ fn build_book_metadata_fragment(
         cover_resource_name,
         asset_id: Some(container_id),
         book_id,
+        asin,
     };
 
     // Build each category using the schema
@@ -655,16 +823,26 @@ fn build_book_metadata_fragment(
         MetadataCategory::KindleEbook,
         MetadataCategory::KindleTitle,
         MetadataCategory::KindleAudit,
+        MetadataCategory::KindleCapability,
     ];
 
     let categorised: Vec<IonValue> = categories
         .iter()
         .map(|&cat| {
             let entries = build_category_entries(cat, meta, &meta_ctx);
-            let ion_entries: Vec<IonValue> = entries
+            let mut ion_entries: Vec<IonValue> = entries
                 .into_iter()
                 .map(|(k, v)| metadata_kv(k, &v))
                 .collect();
+
+            // Boolean entries (the schema only carries string values)
+            if cat == MetadataCategory::KindleTitle {
+                ion_entries.push(metadata_kv_bool("is_sample", false));
+                if has_embedded_fonts {
+                    // Render with the publisher's embedded fonts by default
+                    ion_entries.push(metadata_kv_bool("override_kindle_font", true));
+                }
+            }
 
             IonValue::Struct(vec![
                 (
@@ -689,6 +867,14 @@ fn metadata_kv(key: &str, value: &str) -> IonValue {
     IonValue::Struct(vec![
         (KfxSymbol::Key as u64, IonValue::String(key.to_string())),
         (KfxSymbol::Value as u64, IonValue::String(value.to_string())),
+    ])
+}
+
+/// Helper to create a metadata key-value struct with a boolean value.
+fn metadata_kv_bool(key: &str, value: bool) -> IonValue {
+    IonValue::Struct(vec![
+        (KfxSymbol::Key as u64, IonValue::String(key.to_string())),
+        (KfxSymbol::Value as u64, IonValue::Bool(value)),
     ])
 }
 
@@ -790,7 +976,7 @@ fn build_document_data_fragment(ctx: &ExportContext) -> KfxFragment {
     // Calculate max_id from context (highest EID used)
     let max_id = ctx.max_eid();
 
-    let document_data = IonValue::Struct(vec![
+    let mut document_data_fields = vec![
         (
             KfxSymbol::Direction as u64,
             IonValue::Symbol(KfxSymbol::Ltr as u64),
@@ -839,7 +1025,18 @@ fn build_document_data_fragment(ctx: &ExportContext) -> KfxFragment {
             KfxSymbol::ReadingOrders as u64,
             IonValue::List(vec![reading_order]),
         ),
-    ]);
+    ];
+
+    // The embedded publisher font becomes the document default; styles
+    // reference "default" so the Kindle font selector still works.
+    if let Some(family) = ctx.embedded_font_families.first() {
+        document_data_fields.push((
+            KfxSymbol::FontFamily as u64,
+            IonValue::String(family.clone()),
+        ));
+    }
+
+    let document_data = IonValue::Struct(document_data_fields);
 
     KfxFragment::singleton(KfxSymbol::DocumentData, document_data)
 }
@@ -943,15 +1140,18 @@ fn build_headings_entries(ctx: &ExportContext) -> Vec<IonValue> {
         by_level.entry(heading.level).or_default().push(heading);
     }
 
-    // Convert heading level to KFX symbol
+    // Convert heading level to KFX symbol.
+    // h1 is included: Kindle Previewer emits an h1 group, and the headings
+    // container drives the device's chapter-skip navigation.
     fn level_to_symbol(level: u8) -> Option<KfxSymbol> {
         match level {
+            1 => Some(KfxSymbol::H1),
             2 => Some(KfxSymbol::H2),
             3 => Some(KfxSymbol::H3),
             4 => Some(KfxSymbol::H4),
             5 => Some(KfxSymbol::H5),
             6 => Some(KfxSymbol::H6),
-            _ => None, // h1 not typically used in body
+            _ => None,
         }
     }
 
@@ -1605,7 +1805,8 @@ fn build_external_resource_fragment(
     KfxFragment::new(KfxSymbol::ExternalResource, &resource_name, ion)
 }
 
-/// Build a resource fragment (bcRawMedia $417) - the actual bytes.
+/// Build a resource fragment (bcRawMedia $417, or bcRawFont $418 for fonts) -
+/// the actual bytes.
 fn build_resource_fragment(href: &str, data: &[u8], ctx: &mut ExportContext) -> KfxFragment {
     // Use resource/ prefix to distinguish from external_resource fragment
     // This ensures bcRawMedia gets a different entity ID
@@ -1615,8 +1816,15 @@ fn build_resource_fragment(href: &str, data: &[u8], ctx: &mut ExportContext) -> 
     // Register the prefixed name as a symbol
     ctx.symbols.get_or_intern(&raw_name);
 
+    // Kindle loads embedded fonts only from bcRawFont entities
+    let type_symbol = if detect_media_format(href, data).is_font() {
+        KfxSymbol::Bcrawfont
+    } else {
+        KfxSymbol::Bcrawmedia
+    };
+
     // Create raw fragment for binary resources
-    KfxFragment::raw(KfxSymbol::Bcrawmedia as u64, &raw_name, data.to_vec())
+    KfxFragment::raw(type_symbol as u64, &raw_name, data.to_vec())
 }
 
 /// Build font entity fragments ($262) from @font-face rules.
@@ -2266,7 +2474,7 @@ mod tests {
         let ctx = ExportContext::new();
         let container_id = generate_container_id();
 
-        let frag = build_book_metadata_fragment(&book, &container_id, &ctx);
+        let frag = build_book_metadata_fragment(&book, &container_id, false, &ctx);
 
         // Should be $490 (book_metadata) type
         assert_eq!(frag.ftype, KfxSymbol::BookMetadata as u64);
@@ -2291,8 +2499,8 @@ mod tests {
                     .map(|(_, v)| v);
 
                 if let Some(IonValue::List(categories)) = categorised {
-                    // Should have 3 categories
-                    assert_eq!(categories.len(), 3, "should have 3 metadata categories");
+                    // title, ebook, audit, capability (matching Kindle Previewer)
+                    assert_eq!(categories.len(), 4, "should have 4 metadata categories");
                 } else {
                     panic!("categorised_metadata should be a list");
                 }
@@ -2659,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_headings_entries_ignores_h1() {
+    fn test_build_headings_entries_includes_h1() {
         use crate::kfx::context::HeadingPosition;
 
         let mut ctx = ExportContext::new();
@@ -2670,8 +2878,9 @@ mod tests {
             offset: 0,
         });
 
+        // Kindle Previewer emits an h1 group; it drives chapter-skip navigation
         let entries = build_headings_entries(&ctx);
-        assert!(entries.is_empty(), "h1 should be ignored");
+        assert_eq!(entries.len(), 1, "h1 should produce a headings group");
     }
 
     #[test]
@@ -2827,7 +3036,12 @@ mod entity_structure_tests {
         let mut fragments = Vec::new();
 
         fragments.push(build_content_features_fragment());
-        fragments.push(build_book_metadata_fragment(&book, &container_id, &ctx));
+        fragments.push(build_book_metadata_fragment(
+            &book,
+            &container_id,
+            false,
+            &ctx,
+        ));
         fragments.push(build_metadata_fragment(&ctx));
         fragments.push(build_document_data_fragment(&ctx));
         fragments.push(build_book_navigation_fragment_with_positions(&book, &ctx));
@@ -3072,6 +3286,20 @@ mod resource_export_tests {
             "KFX should include image data, got {} bytes",
             data.len()
         );
+    }
+
+    #[test]
+    fn test_fonts_exported_as_bcrawfont() {
+        let mut ctx = ExportContext::new();
+
+        // Fonts must be bcRawFont ($418) - Kindle only loads embedded fonts
+        // from bcRawFont entities
+        let font = build_resource_fragment("fonts/a.otf", b"OTTO\x00\x01", &mut ctx);
+        assert_eq!(font.ftype, KfxSymbol::Bcrawfont as u64);
+
+        // Images stay bcRawMedia ($417)
+        let img = build_resource_fragment("images/a.jpg", &[0xFF, 0xD8, 0xFF, 0xE0], &mut ctx);
+        assert_eq!(img.ftype, KfxSymbol::Bcrawmedia as u64);
     }
 
     #[test]

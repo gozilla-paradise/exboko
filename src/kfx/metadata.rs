@@ -15,6 +15,8 @@ pub enum MetadataCategory {
     KindleEbook,
     /// Creator/audit information
     KindleAudit,
+    /// Capability metadata (emitted empty, matching Kindle Previewer)
+    KindleCapability,
 }
 
 impl MetadataCategory {
@@ -24,6 +26,7 @@ impl MetadataCategory {
             MetadataCategory::KindleTitle => "kindle_title_metadata",
             MetadataCategory::KindleEbook => "kindle_ebook_metadata",
             MetadataCategory::KindleAudit => "kindle_audit_metadata",
+            MetadataCategory::KindleCapability => "kindle_capability_metadata",
         }
     }
 }
@@ -63,6 +66,10 @@ pub enum MetadataField {
     AssetId,
     /// Book ID - from context (derived from identifier), not Metadata.
     BookId,
+    /// ASIN - from context (derived from identifier), not Metadata.
+    Asin,
+    /// Content ID - from context (same value as ASIN), not Metadata.
+    ContentId,
     /// dcterms:modified timestamp
     ModifiedDate,
     /// First contributor with role="trl" (translator)
@@ -90,8 +97,11 @@ impl MetadataField {
                 }
             }
             MetadataField::Language => {
+                // Kindle requires a language (Kindle Previewer aborts on EPUBs
+                // without dc:language, error E23005). Fall back to "en" like
+                // the EPUB exporter does.
                 if meta.language.is_empty() {
-                    None
+                    Some("en")
                 } else {
                     Some(&meta.language)
                 }
@@ -120,7 +130,11 @@ impl MetadataField {
             MetadataField::AuthorSort => meta.author_sort.as_deref(),
             MetadataField::SeriesName => meta.collection.as_ref().map(|c| c.name.as_str()),
             // These are context-driven or need special handling
-            MetadataField::AssetId | MetadataField::BookId | MetadataField::SeriesPosition => None,
+            MetadataField::AssetId
+            | MetadataField::BookId
+            | MetadataField::Asin
+            | MetadataField::ContentId
+            | MetadataField::SeriesPosition => None,
         }
     }
 }
@@ -177,10 +191,24 @@ pub fn metadata_schema() -> Vec<MetadataRule> {
             category: MetadataCategory::KindleTitle,
             source: MetadataSource::Dynamic(MetadataField::BookId),
         },
+        // PDOC (personal document) rather than EBOK: Kindle devices only show
+        // library cover thumbnails for sideloaded EBOK books if the cover can
+        // be fetched from Amazon by ASIN. PDOC renders the embedded cover.
+        // This matches the Calibre KFX Output plugin / Kindle Previewer.
         MetadataRule {
             key: "cde_content_type",
             category: MetadataCategory::KindleTitle,
-            source: MetadataSource::Static("EBOK"),
+            source: MetadataSource::Static("PDOC"),
+        },
+        MetadataRule {
+            key: "ASIN",
+            category: MetadataCategory::KindleTitle,
+            source: MetadataSource::Dynamic(MetadataField::Asin),
+        },
+        MetadataRule {
+            key: "content_id",
+            category: MetadataCategory::KindleTitle,
+            source: MetadataSource::Dynamic(MetadataField::ContentId),
         },
         // Extended metadata for better round-trip fidelity
         MetadataRule {
@@ -251,6 +279,9 @@ pub struct MetadataContext<'a> {
     /// Book ID (stable per publication, derived from identifier).
     /// Format: 23-character URL-safe Base64.
     pub book_id: Option<String>,
+    /// ASIN / content_id (stable per publication, derived from identifier).
+    /// Format: 32 uppercase alphanumeric characters.
+    pub asin: Option<String>,
 }
 
 /// Generate a book ID from a publication identifier.
@@ -280,6 +311,39 @@ pub fn generate_book_id(identifier: &str) -> String {
 
     // URL-safe Base64 encode (no padding), 17 bytes → 23 chars
     base64_url_encode(&bytes[..17])
+}
+
+/// Generate an ASIN-style identifier from a publication identifier.
+///
+/// Like the book ID, this is derived deterministically from the book's
+/// identifier so it stays stable across exports. The Calibre KFX Output
+/// plugin emits a random 32-character value; Kindle only needs it to be
+/// unique per book.
+///
+/// Format: 32 uppercase alphanumeric characters.
+pub fn generate_asin(identifier: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+    let mut result = String::with_capacity(32);
+    let mut hasher = DefaultHasher::new();
+    identifier.hash(&mut hasher);
+    "boko-asin".hash(&mut hasher);
+
+    let mut hash = hasher.finish();
+    for i in 0..32 {
+        if i % 12 == 0 {
+            // Re-hash periodically: one u64 only yields ~12 base-36 digits
+            hash.hash(&mut hasher);
+            hash = hasher.finish();
+        }
+        result.push(ALPHABET[(hash % 36) as usize] as char);
+        hash /= 36;
+    }
+
+    result
 }
 
 /// URL-safe Base64 encoding without padding.
@@ -353,6 +417,10 @@ pub fn build_category_entries(
                     MetadataField::BookId => {
                         // Book ID from context (derived from identifier)
                         ctx.book_id.clone()
+                    }
+                    MetadataField::Asin | MetadataField::ContentId => {
+                        // ASIN and content_id share the same derived value
+                        ctx.asin.clone()
                     }
                     MetadataField::SeriesPosition => {
                         // Series position from collection
@@ -573,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cde_content_type_is_ebok() {
+    fn test_cde_content_type_is_pdoc() {
         let meta = Metadata {
             title: "Test".to_string(),
             language: "en".to_string(),
@@ -586,7 +654,53 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|(k, v)| *k == "cde_content_type" && v == "EBOK")
+                .any(|(k, v)| *k == "cde_content_type" && v == "PDOC")
+        );
+    }
+
+    #[test]
+    fn test_language_falls_back_to_en_when_empty() {
+        let meta = Metadata {
+            title: "Test".to_string(),
+            language: String::new(),
+            ..Default::default()
+        };
+
+        let ctx = MetadataContext::default();
+        let entries = build_category_entries(MetadataCategory::KindleTitle, &meta, &ctx);
+
+        assert!(entries.iter().any(|(k, v)| *k == "language" && v == "en"));
+    }
+
+    #[test]
+    fn test_asin_and_content_id_from_context() {
+        let meta = Metadata {
+            title: "Test".to_string(),
+            language: "en".to_string(),
+            ..Default::default()
+        };
+
+        let asin = super::generate_asin("urn:uuid:test-id");
+        assert_eq!(asin.len(), 32);
+        assert!(
+            asin.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        );
+        // Deterministic per identifier
+        assert_eq!(asin, super::generate_asin("urn:uuid:test-id"));
+        assert_ne!(asin, super::generate_asin("urn:uuid:other-id"));
+
+        let ctx = MetadataContext {
+            asin: Some(asin.clone()),
+            ..Default::default()
+        };
+        let entries = build_category_entries(MetadataCategory::KindleTitle, &meta, &ctx);
+
+        assert!(entries.iter().any(|(k, v)| *k == "ASIN" && *v == asin));
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| *k == "content_id" && *v == asin)
         );
     }
 

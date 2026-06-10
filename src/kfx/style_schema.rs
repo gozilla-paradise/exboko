@@ -2052,9 +2052,16 @@ pub fn extract_ir_field(ir_style: &ir_style::ComputedStyle, field: IrField) -> O
                 None
             }
         }
-        // BoxAlign: derived from margin-left: auto + margin-right: auto
+        // BoxAlign: derived from margin-left: auto + margin-right: auto.
+        // Length defaults to Auto, so unset margins are indistinguishable from
+        // explicit `margin: auto` here; require a constrained width as evidence
+        // of intentional centering (auto margins have no effect on a full-width
+        // box anyway). Otherwise every paragraph would get box_align: center.
         IrField::BoxAlign => {
-            if ir_style.margin_left == ir_style::Length::Auto
+            let width_constrained = ir_style.width != ir_style::Length::Auto
+                || ir_style.max_width != ir_style::Length::Auto;
+            if width_constrained
+                && ir_style.margin_left == ir_style::Length::Auto
                 && ir_style.margin_right == ir_style::Length::Auto
             {
                 Some("center".to_string())
@@ -3787,8 +3794,9 @@ mod tests {
     fn test_box_align_from_margin_auto() {
         use crate::style::{ComputedStyle, Length};
 
-        // margin-left: auto + margin-right: auto → box_align: center
+        // width + margin-left: auto + margin-right: auto → box_align: center
         let mut style = ComputedStyle::default();
+        style.width = Length::Percent(50.0);
         style.margin_left = Length::Auto;
         style.margin_right = Length::Auto;
 
@@ -3802,8 +3810,23 @@ mod tests {
 
         // Only margin-left: auto is not enough
         let mut style = ComputedStyle::default();
+        style.width = Length::Percent(50.0);
         style.margin_left = Length::Auto;
         style.margin_right = Length::Px(0.0);
+
+        let result = extract_ir_field(&style, IrField::BoxAlign);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_box_align_not_emitted_without_width() {
+        use crate::style::{ComputedStyle, Length};
+
+        // Margins default to Auto when unset; a full-width box must not be
+        // treated as intentionally centered.
+        let style = ComputedStyle::default();
+        assert_eq!(style.margin_left, Length::Auto);
+        assert_eq!(style.margin_right, Length::Auto);
 
         let result = extract_ir_field(&style, IrField::BoxAlign);
         assert_eq!(result, None);

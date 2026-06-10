@@ -663,6 +663,12 @@ pub struct ExportContext {
     /// Maps section_name → set of resource short names (e.g., "e6") referenced by that section.
     /// Used to build the container_entity_map dependency graph so Kindle can locate images.
     pub section_resource_deps: BTreeMap<String, BTreeSet<String>>,
+
+    /// Embedded font family names from @font-face rules.
+    /// Style font_family values matching these are rewritten to "default" so
+    /// the Kindle font selector still works; the embedded font becomes the
+    /// document default instead.
+    pub embedded_font_families: Vec<String>,
 }
 
 /// Position of a heading element for navigation.
@@ -728,6 +734,7 @@ impl ExportContext {
             content_ids_by_chapter: HashMap::new(),
             content_id_lengths: HashMap::new(),
             section_resource_deps: BTreeMap::new(),
+            embedded_font_families: Vec::new(),
         }
     }
 
