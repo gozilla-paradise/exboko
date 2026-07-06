@@ -133,6 +133,100 @@ pub fn extract_image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
+/// Check whether PNG data contains transparency.
+///
+/// Detects an alpha channel (IHDR color type 4 or 6) or a tRNS chunk
+/// (palette/grayscale/truecolor transparency) without decoding pixel data.
+pub fn png_has_transparency(data: &[u8]) -> bool {
+    const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    // Signature (8) + IHDR chunk header (8) + IHDR data (13): color type at byte 25
+    if data.len() < 26 || &data[..8] != PNG_SIGNATURE {
+        return false;
+    }
+    let color_type = data[25];
+    if color_type == 4 || color_type == 6 {
+        return true;
+    }
+
+    // Scan chunks for tRNS (must appear before IDAT per the PNG spec)
+    let mut i = 8;
+    while i + 8 <= data.len() {
+        let len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        let chunk_type = &data[i + 4..i + 8];
+        match chunk_type {
+            b"tRNS" => return true,
+            b"IDAT" | b"IEND" => return false,
+            _ => {}
+        }
+        // len + length field (4) + type (4) + CRC (4)
+        i = match i.checked_add(len + 12) {
+            Some(next) => next,
+            None => return false,
+        };
+    }
+    false
+}
+
+/// Flatten PNG transparency onto a white background.
+///
+/// Kindle's KFX renderer composites image transparency over black, so
+/// transparent areas render as black patches. Kindle Previewer flattens
+/// transparency at conversion time; this does the same for KFX export.
+///
+/// Returns `Some(reencoded PNG)` with the alpha channel composited over
+/// white, or `None` if the input has no transparency (or isn't decodable) —
+/// callers keep the original bytes in that case.
+pub fn flatten_png_transparency(data: &[u8]) -> Option<Vec<u8>> {
+    if !png_has_transparency(data) {
+        return None;
+    }
+
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    // EXPAND converts palette to RGB and tRNS chunks to a full alpha channel;
+    // STRIP_16 reduces 16-bit channels to 8-bit.
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+
+    let (pixels, color_type) = match info.color_type {
+        png::ColorType::GrayscaleAlpha => {
+            let mut out = Vec::with_capacity(buf.len() / 2);
+            for px in buf.as_chunks::<2>().0 {
+                out.push(composite_over_white(px[0], px[1]));
+            }
+            (out, png::ColorType::Grayscale)
+        }
+        png::ColorType::Rgba => {
+            let mut out = Vec::with_capacity(buf.len() / 4 * 3);
+            for px in buf.as_chunks::<4>().0 {
+                let a = px[3];
+                out.push(composite_over_white(px[0], a));
+                out.push(composite_over_white(px[1], a));
+                out.push(composite_over_white(px[2], a));
+            }
+            (out, png::ColorType::Rgb)
+        }
+        // No alpha after expansion; nothing to flatten
+        _ => return None,
+    };
+
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, info.width, info.height);
+    encoder.set_color(color_type);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(&pixels).ok()?;
+    writer.finish().ok()?;
+    Some(out)
+}
+
+/// Composite a single channel value over a white background.
+fn composite_over_white(channel: u8, alpha: u8) -> u8 {
+    ((channel as u32 * alpha as u32 + 255 * (255 - alpha as u32) + 127) / 255) as u8
+}
+
 /// Extract dimensions from JPEG data by parsing SOF markers.
 fn extract_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     let mut i = 2;
@@ -411,6 +505,74 @@ pub fn extract_xml_encoding(bytes: &[u8]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_png(width: u32, height: u32, color: png::ColorType, pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(color);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(pixels).unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    fn decode_png(data: &[u8]) -> (png::OutputInfo, Vec<u8>) {
+        let decoder = png::Decoder::new(std::io::Cursor::new(data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        buf.truncate(info.buffer_size());
+        (info, buf)
+    }
+
+    #[test]
+    fn test_png_has_transparency() {
+        let rgba = encode_png(1, 1, png::ColorType::Rgba, &[0, 0, 0, 0]);
+        assert!(png_has_transparency(&rgba));
+
+        let rgb = encode_png(1, 1, png::ColorType::Rgb, &[10, 20, 30]);
+        assert!(!png_has_transparency(&rgb));
+
+        assert!(!png_has_transparency(b"not a png"));
+        assert!(!png_has_transparency(&[]));
+    }
+
+    #[test]
+    fn test_flatten_png_transparency_rgba() {
+        // 2x1: fully transparent + half-transparent red
+        let rgba = encode_png(2, 1, png::ColorType::Rgba, &[0, 0, 0, 0, 255, 0, 0, 128]);
+        let flat = flatten_png_transparency(&rgba).expect("should flatten");
+
+        assert!(!png_has_transparency(&flat));
+        let (info, pixels) = decode_png(&flat);
+        assert_eq!(info.color_type, png::ColorType::Rgb);
+        // Transparent pixel becomes white
+        assert_eq!(&pixels[..3], &[255, 255, 255]);
+        // Half-transparent red composited over white: r=255, g=b=255*(1-128/255)
+        assert_eq!(pixels[3], 255);
+        assert_eq!(pixels[4], pixels[5]);
+        assert!(pixels[4] > 120 && pixels[4] < 135);
+    }
+
+    #[test]
+    fn test_flatten_png_transparency_grayscale_alpha() {
+        let ga = encode_png(1, 1, png::ColorType::GrayscaleAlpha, &[0, 0]);
+        let flat = flatten_png_transparency(&ga).expect("should flatten");
+
+        let (info, pixels) = decode_png(&flat);
+        assert_eq!(info.color_type, png::ColorType::Grayscale);
+        assert_eq!(pixels[0], 255);
+    }
+
+    #[test]
+    fn test_flatten_png_transparency_opaque_passthrough() {
+        let rgb = encode_png(1, 1, png::ColorType::Rgb, &[10, 20, 30]);
+        assert!(flatten_png_transparency(&rgb).is_none());
+
+        // Non-PNG data must be left alone
+        assert!(flatten_png_transparency(b"\xFF\xD8\xFFjpegish").is_none());
+    }
 
     #[test]
     fn test_detect_media_format_by_extension() {

@@ -29,7 +29,7 @@ use crate::model::{
     AnchorTarget, Book, Chapter, GlobalNodeId, LandmarkType, NodeId, ResolvedLinks, Role,
 };
 use crate::style::{ComputedStyle as IrComputedStyle, Length as IrLength};
-use crate::util::detect_media_format;
+use crate::util::{MediaFormat, detect_media_format, flatten_png_transparency};
 
 /// KFX export configuration.
 #[derive(Debug, Clone, Default)]
@@ -397,9 +397,16 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
     // Kindle Previewer output (fonts are referenced by font entities via location).
     for asset_path in &asset_paths {
         if is_media_asset(asset_path)
-            && let Ok(data) = book.load_asset(asset_path)
+            && let Ok(mut data) = book.load_asset(asset_path)
         {
             let href = asset_path.to_string_lossy().to_string();
+            // Kindle's KFX renderer composites PNG transparency over black,
+            // so flatten transparent PNGs onto white (as Kindle Previewer does).
+            if detect_media_format(&href, &data) == MediaFormat::Png
+                && let Some(flattened) = flatten_png_transparency(&data)
+            {
+                data = flattened;
+            }
             if !detect_media_format(&href, &data).is_font() {
                 // external_resource ($164) - metadata about the resource
                 fragments.push(build_external_resource_fragment(&href, &data, &mut ctx));
